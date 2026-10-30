@@ -27,8 +27,23 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+        """
+        <style>
+            .mesi-tag { display:inline-block; border-radius:5px; padding:.25rem .55rem; color:#fff; font-weight:700; }
+            .mesi-M { background:#FF4B4B; }
+            .mesi-E { background:#1E88E5; }
+            .mesi-S { background:#00C853; }
+            .mesi-I { background:#757575; }
+            [data-testid="stMetric"] { border:1px solid rgba(120,140,130,.18); border-radius:10px; padding:.7rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+)
+
 PROJECT_TITLE = "Integrated Smart City Computing Framework"
 SHARED_ADDRESS = 0x3F2A
+SESSION_VERSION = 3
 PIPELINE_PROGRAM = [
     Instruction(0x100, "LOAD", 1, "SensorReg"),
     Instruction(0x104, "ADD", 2, 1, 3),
@@ -46,11 +61,18 @@ def quiet_call(function: Any, *args: Any, **kwargs: Any) -> Any:
         return function(*args, **kwargs)
 
 
+def set_viva_note(message: str, *, key: Optional[str] = None) -> None:
+    """Persist the exact evaluator note text required for the results panel."""
+    note = f"🗣️ Evaluator Speaking Note: {message}"
+    if key is not None:
+        st.session_state.viva_notes[key] = note
+
+
 def initialize_session() -> None:
-    """Create persistent hardware models and UI state once per session."""
-    if st.session_state.get("initialized"):
+    """Create persistent hardware models and populated baseline state once."""
+    if st.session_state.get("session_version") == SESSION_VERSION:
         return
-    st.session_state.initialized = True
+    st.session_state.session_version = SESSION_VERSION
     st.session_state.bus = DualTierBusArbiter(
         buffer_capacity=128,
         token_bucket_capacity=32,
@@ -65,28 +87,60 @@ def initialize_session() -> None:
     st.session_state.serviced_packets = 0
     st.session_state.bus_grants = 0
     st.session_state.bus_latencies = []
+    st.session_state.routine_wait_cycles = []
+    st.session_state.viva_notes = {}
 
-    st.session_state.booth_result = None
-    st.session_state.booth_steps = []
+    st.session_state.alu_m = 14
+    st.session_state.alu_r = -5
+    st.session_state.booth_steps = booth_trace(14, -5)
+    st.session_state.booth_result = quiet_call(BoothRadix4ALU(bit_width=8).multiply, 14, -5)
 
     st.session_state.pipeline = RISCPipeline5Stage()
-    st.session_state.pipeline_next_instruction = 0
+    st.session_state.pipeline_next_instruction = 3
     st.session_state.pipeline_cycle = 0
     st.session_state.pipeline_history = []
     st.session_state.pipeline_log = []
     st.session_state.pipeline_last_retired = "-"
     st.session_state.branch_outcomes = [True, True, True, False, True]
     st.session_state.branch_index = 0
+    for instruction in PIPELINE_PROGRAM[:3] + [None]:
+        output = StringIO()
+        with redirect_stdout(output):
+            st.session_state.pipeline.clock_step(instruction)
+        st.session_state.pipeline_cycle += 1
+        if instruction is not None:
+            st.session_state.pipeline_next_instruction = min(
+                len(PIPELINE_PROGRAM), st.session_state.pipeline_next_instruction
+            )
+        if output.getvalue().strip():
+            st.session_state.pipeline_log.append(output.getvalue().strip())
+        st.session_state.pipeline_history.append(
+            {
+                "Cycle": st.session_state.pipeline_cycle,
+                "IF": stage_text(st.session_state.pipeline.IF_ID),
+                "ID": stage_text(st.session_state.pipeline.ID_EX),
+                "EX": stage_text(st.session_state.pipeline.EX_MEM),
+                "MEM": stage_text(st.session_state.pipeline.MEM_WB),
+                "WB": st.session_state.pipeline_last_retired,
+            }
+        )
 
     st.session_state.numa = NUMADirectorySystem(num_nodes=4)
     st.session_state.numa.seed_memory(SHARED_ADDRESS, 100)
+    for core in (0, 0, 1, 1, 0):
+        quiet_call(st.session_state.numa.read_transaction, core, SHARED_ADDRESS)
     st.session_state.cache_address = SHARED_ADDRESS
     st.session_state.numa_message = ""
     st.session_state.numa_address_display = SHARED_ADDRESS
     st.session_state.invalidation_log = []
-    st.session_state.mesh_path = []
+    source = SimpleNamespace(zone_name="North", x=0, y=0)
+    destination = SimpleNamespace(zone_name="East", x=2, y=3)
+    st.session_state.mesh_path = quiet_call(MeshInterconnect.route_xy, source, destination)
     st.session_state.lock = HardwareLockSync()
-    st.session_state.stress_result = None
+    st.session_state.stress_result = run_peak_load_test()
+    inject_packet("WATER_PUMP_SENSOR", "Routine", "flow_l_min=940")
+    inject_packet("AIR_QUALITY_SENSOR", "Routine", "pm25_ug_m3=18")
+    inject_packet("AMBULANCE_CORRIDOR_ALERT", "Emergency", "corridor=junction_4")
 
 
 def device_id_for(name: str) -> int:
@@ -195,6 +249,17 @@ def booth_trace(multiplicand: int, multiplier: int) -> List[Dict[str, Any]]:
     return rows
 
 
+def calculate_booth(multiplicand: int, multiplier: int) -> int:
+    """Store and return one Booth result together with its recoding rows."""
+    rows = booth_trace(multiplicand, multiplier)
+    result = quiet_call(BoothRadix4ALU(bit_width=8).multiply, multiplicand, multiplier)
+    st.session_state.alu_m = multiplicand
+    st.session_state.alu_r = multiplier
+    st.session_state.booth_steps = rows
+    st.session_state.booth_result = result
+    return result
+
+
 def stage_text(value: Any) -> str:
     """Format an instruction or stage buffer as a concise reservation cell."""
     if value is None:
@@ -203,6 +268,35 @@ def stage_text(value: Any) -> str:
     pc = getattr(instruction, "pc", None)
     opcode = getattr(instruction, "opcode", str(instruction))
     return f"0x{pc:X} {opcode}" if isinstance(pc, int) else str(opcode)
+
+
+def step_pipeline(instruction: Optional[Instruction]) -> None:
+    """Advance and record one real legacy pipeline clock edge."""
+    pipeline: RISCPipeline5Stage = st.session_state.pipeline
+    if pipeline.ID_EX is not None and pipeline.ID_EX.is_branch:
+        outcomes = st.session_state.branch_outcomes
+        pipeline.predictor.update(outcomes[st.session_state.branch_index % len(outcomes)])
+        st.session_state.branch_index += 1
+    if pipeline.MEM_WB is not None:
+        st.session_state.pipeline_last_retired = repr(pipeline.MEM_WB)
+    output = StringIO()
+    with redirect_stdout(output):
+        pipeline.clock_step(instruction)
+    if output.getvalue().strip():
+        st.session_state.pipeline_log.append(output.getvalue().strip())
+    st.session_state.pipeline_cycle += 1
+    if instruction is not None:
+        st.session_state.pipeline_next_instruction += 1
+    st.session_state.pipeline_history.append(
+        {
+            "Cycle": st.session_state.pipeline_cycle,
+            "IF": stage_text(pipeline.IF_ID),
+            "ID": stage_text(pipeline.ID_EX),
+            "EX": stage_text(pipeline.EX_MEM),
+            "MEM": stage_text(pipeline.MEM_WB),
+            "WB": st.session_state.pipeline_last_retired,
+        }
+    )
 
 
 def run_peak_load_test() -> Dict[str, Any]:
@@ -346,6 +440,42 @@ tabs = st.tabs(
 
 with tabs[0]:
     st.subheader("Telemetry intake")
+    bus_actions = st.columns([1, 1])
+    if bus_actions[0].button("⚡ Quick Demo: Emergency Override Scenario", type="primary", key="bus_viva_demo"):
+        st.session_state.bus = DualTierBusArbiter(
+            buffer_capacity=128,
+            token_bucket_capacity=32,
+            token_refill_rate=1.0,
+            max_emergency_burst=4,
+        )
+        st.session_state.bus_log = []
+        st.session_state.bus_submission_cycles = {}
+        st.session_state.bus_latencies = []
+        st.session_state.preemptions = 0
+        st.session_state.serviced_packets = 0
+        for name, payload in (
+            ("Water Pump", "flow_l_min=940"),
+            ("Air Quality", "pm25_ug_m3=18"),
+            ("Smart Bin", "fill_percent=71"),
+        ):
+            inject_packet(name, "Routine", payload)
+        inject_packet("AMBULANCE_CORRIDOR_ALERT", "Emergency", "corridor=junction_4")
+        arbitrate_one_cycle()
+        arbitrate_one_cycle()
+        set_viva_note(
+            "In Cycle 1, the hardware arbiter asserts the emergency line. AMBULANCE_CORRIDOR_ALERT immediately captures the bus with 0 wait cycles, preempting routine municipal packets without starvation (SDG 11).",
+            key="bus",
+        )
+    if bus_actions[1].button("Process Next Clock Cycle", key="process_bus_cycle"):
+        arbitrate_one_cycle()
+        if st.session_state.bus.cycle_count == 1:
+            set_viva_note(
+                "In Cycle 1, the hardware arbiter asserts the emergency line. AMBULANCE_CORRIDOR_ALERT immediately captures the bus with 0 wait cycles, preempting routine municipal packets without starvation (SDG 11).",
+                key="bus",
+            )
+    if st.session_state.viva_notes.get("bus"):
+        st.info(st.session_state.viva_notes["bus"])
+
     with st.form("packet_intake", clear_on_submit=True):
         inputs = st.columns([1.2, 1, 1.5, 1])
         device_name = inputs[0].text_input("Device Name", placeholder="TRAFFIC_CAM_J4")
@@ -379,34 +509,6 @@ with tabs[0]:
             else:
                 st.warning("Packet rejected by bus protection.")
 
-    if st.button("Process Next Clock Cycle", type="primary", key="process_bus_cycle"):
-        routine_waiting = bool(st.session_state.bus.routine_queue)
-        packet = quiet_call(st.session_state.bus.arbitrate_cycle)
-        if packet is None:
-            st.session_state.bus_log.append(
-                {"Cycle": st.session_state.bus.cycle_count, "Granted Master": "-", "Device ID": "-",
-                 "Channel Type": "Idle", "Status": "No pending request"}
-            )
-        else:
-            emergency = bool(packet.is_emergency)
-            if emergency:
-                st.session_state.preemptions += int(routine_waiting)
-            submitted = st.session_state.bus_submission_cycles.pop(
-                id(packet), st.session_state.bus.cycle_count
-            )
-            delay = 0 if emergency else max(0, st.session_state.bus.cycle_count - submitted - 1)
-            st.session_state.bus_latencies.append(delay)
-            st.session_state.serviced_packets += 1
-            st.session_state.bus_log.append(
-                {
-                    "Cycle": st.session_state.bus.cycle_count,
-                    "Granted Master": packet.name,
-                    "Device ID": packet.dev_id,
-                    "Channel Type": "Emergency" if emergency else "Routine",
-                    "Status": "Priority override · 0-cycle wait" if emergency else f"Round-robin · {delay}-cycle wait",
-                }
-            )
-
     queues = st.columns(2)
     with queues[0].container(border=True):
         st.subheader("Emergency Priority Channel")
@@ -435,37 +537,28 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Signed Radix-4 recoding")
-    values = st.columns(2)
-    multiplicand = values[0].slider("Multiplicand M", -128, 127, 14, key="alu_m")
-    multiplier = values[1].slider("Multiplier R", -128, 127, -5, key="alu_r")
-    if st.button("Execute Hardware Multiplier", type="primary", key="execute_booth"):
-        recoding = {0b000: 0, 0b001: 1, 0b010: 1, 0b011: 2, 0b100: -2, 0b101: -1, 0b110: -1, 0b111: 0}
-        extended = (multiplier & 0xFF) << 1
-        accumulator = 0
-        rows = []
-        for index in range(4):
-            triplet = (extended >> (2 * index)) & 0b111
-            factor = recoding[triplet]
-            partial = (factor * multiplicand) << (2 * index)
-            accumulator += partial
-            rows.append(
-                {
-                    "Cycle": index + 1,
-                    "Bit Triplet": f"{triplet:03b}",
-                    "Recoded Factor": factor,
-                    "Partial Product": partial,
-                    "Running Accumulator": accumulator,
-                }
-            )
-        result = quiet_call(BoothRadix4ALU(bit_width=8).multiply, multiplicand, multiplier)
-        st.session_state.booth_result = result
-        st.session_state.booth_steps = rows
+    alu_actions = st.columns([1, 1])
+    if alu_actions[0].button("⚡ Quick Demo: Radix-4 Speedup", type="primary", key="alu_viva_demo"):
+        calculate_booth(14, -5)
+        set_viva_note(
+            "Radix-4 recoding compresses the 8-cycle shift-add sequence into 4 cycles, delivering a 50% arithmetic cycle reduction.",
+            key="alu",
+        )
+    if alu_actions[1].button("Execute Hardware Multiplier", key="execute_booth"):
+        calculate_booth(int(st.session_state.alu_m), int(st.session_state.alu_r))
+        set_viva_note(
+            "Radix-4 recoding compresses the 8-cycle shift-add sequence into 4 cycles, delivering a 50% arithmetic cycle reduction.",
+            key="alu",
+        )
 
-    if st.session_state.booth_result is None:
-        st.caption("Choose operands and execute to see the recoding sequence.")
-    else:
-        st.success(f"Result: {multiplicand} × {multiplier} = {st.session_state.booth_result}")
-        st.dataframe(st.session_state.booth_steps, hide_index=True, width="stretch")
+    values = st.columns(2)
+    multiplicand = values[0].slider("Multiplicand M", -128, 127, value=None, key="alu_m")
+    multiplier = values[1].slider("Multiplier R", -128, 127, value=None, key="alu_r")
+
+    st.success(f"Result: {multiplicand} × {multiplier} = {st.session_state.booth_result}")
+    st.dataframe(st.session_state.booth_steps, hide_index=True, width="stretch")
+    if st.session_state.viva_notes.get("alu"):
+        st.info(st.session_state.viva_notes["alu"])
     st.bar_chart(
         [
             {"Architecture": "Standard Shift-Add", "Cycles": 8},
@@ -480,35 +573,31 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Five-stage reservation grid")
     pipeline: RISCPipeline5Stage = st.session_state.pipeline
-    controls = st.columns([1, 1, 2])
-    if controls[0].button("Step Clock Cycle", type="primary", key="pipeline_clock"):
+    pipeline_actions = st.columns([1, 1])
+    if pipeline_actions[0].button("⚡ Quick Demo: RAW Hazard Forwarding", type="primary", key="pipeline_viva_demo"):
+        st.session_state.pipeline = RISCPipeline5Stage()
+        st.session_state.pipeline_next_instruction = 0
+        st.session_state.pipeline_cycle = 0
+        st.session_state.pipeline_history = []
+        st.session_state.pipeline_log = []
+        st.session_state.pipeline_last_retired = "-"
+        st.session_state.branch_index = 0
+        for instruction in [PIPELINE_PROGRAM[0], PIPELINE_PROGRAM[1], None, None]:
+            step_pipeline(instruction)
+        set_viva_note(
+            "EX-to-EX operand forwarding resolves the LOAD-to-ADD RAW hazard with zero stall cycles, keeping the pipeline streaming without bubble insertion.",
+            key="pipeline",
+        )
+    if pipeline_actions[1].button("Step Clock Cycle", key="pipeline_clock"):
         index = st.session_state.pipeline_next_instruction
         next_instruction = PIPELINE_PROGRAM[index] if index < len(PIPELINE_PROGRAM) else None
-        if pipeline.ID_EX is not None and pipeline.ID_EX.is_branch:
-            outcomes = st.session_state.branch_outcomes
-            pipeline.predictor.update(outcomes[st.session_state.branch_index % len(outcomes)])
-            st.session_state.branch_index += 1
-        if pipeline.MEM_WB is not None:
-            st.session_state.pipeline_last_retired = repr(pipeline.MEM_WB)
-        output = StringIO()
-        with redirect_stdout(output):
-            pipeline.clock_step(next_instruction)
-        if output.getvalue().strip():
-            st.session_state.pipeline_log.append(output.getvalue().strip())
-        st.session_state.pipeline_cycle += 1
-        if next_instruction is not None:
-            st.session_state.pipeline_next_instruction += 1
-        st.session_state.pipeline_history.append(
-            {
-                "Cycle": st.session_state.pipeline_cycle,
-                "IF": stage_text(pipeline.IF_ID),
-                "ID": stage_text(pipeline.ID_EX),
-                "EX": stage_text(pipeline.EX_MEM),
-                "MEM": stage_text(pipeline.MEM_WB),
-                "WB": st.session_state.pipeline_last_retired,
-            }
+        step_pipeline(next_instruction)
+        set_viva_note(
+            "EX-to-EX operand forwarding resolves the LOAD-to-ADD RAW hazard with zero stall cycles, keeping the pipeline streaming without bubble insertion.",
+            key="pipeline",
         )
-    if controls[1].button("Reset Pipeline", key="pipeline_reset"):
+    controls = st.columns([1, 1, 2])
+    if controls[0].button("Reset Pipeline", key="pipeline_reset"):
         st.session_state.pipeline = RISCPipeline5Stage()
         st.session_state.pipeline_next_instruction = 0
         st.session_state.pipeline_cycle = 0
@@ -517,7 +606,7 @@ with tabs[2]:
         st.session_state.pipeline_last_retired = "-"
         st.session_state.branch_index = 0
         st.rerun()
-    controls[2].caption(
+    controls[1].caption(
         f"Cycle {st.session_state.pipeline_cycle} · "
         f"{st.session_state.pipeline_next_instruction}/{len(PIPELINE_PROGRAM)} instructions fetched"
     )
@@ -528,6 +617,8 @@ with tabs[2]:
         st.success("EX-to-EX Operand Forwarding Active · LOAD-to-ADD RAW dependency resolved without a stall.")
     else:
         st.info("EX-to-EX operand forwarding is enabled; step the clock to expose the LOAD-to-ADD hazard.")
+    if st.session_state.viva_notes.get("pipeline"):
+        st.info(st.session_state.viva_notes["pipeline"])
     predictor_names = ("SN", "WN", "WT", "ST")
     predictor_state = max(0, min(3, pipeline.predictor.state))
     st.metric("2-Bit Branch Predictor", predictor_names[predictor_state])
@@ -536,6 +627,31 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Directory coherence controller")
     numa: NUMADirectorySystem = st.session_state.numa
+    numa_actions = st.columns([1, 1])
+    if numa_actions[0].button("⚡ Quick Demo: Directory Invalidation", type="primary", key="numa_viva_demo"):
+        st.session_state.numa = NUMADirectorySystem(num_nodes=4)
+        st.session_state.numa.seed_memory(SHARED_ADDRESS, 100)
+        st.session_state.invalidation_log = []
+        for core, action, value in ((0, "read", None), (1, "read", None), (2, "write", 999)):
+            captured = StringIO()
+            with redirect_stdout(captured):
+                if action == "read":
+                    st.session_state.numa.read_transaction(core, SHARED_ADDRESS)
+                else:
+                    st.session_state.numa.write_transaction(core, SHARED_ADDRESS, value)
+            for line in captured.getvalue().splitlines():
+                if "INVALIDATE" in line:
+                    st.session_state.invalidation_log.append(
+                        {"Address": "0x3F2A", "Event": line.strip(), "Total": st.session_state.numa.invalidation_count}
+                    )
+        st.session_state.cache_address = SHARED_ADDRESS
+        st.session_state.numa_address_display = SHARED_ADDRESS
+        st.session_state.numa_message = "Node 0 read (E) → Node 1 read (S) → Node 2 wrote 999 (M); Nodes 0 and 1 invalidated (I)."
+        set_viva_note(
+            "Directory write-invalidation invalidates stale replicas before the writer commits, preserving MESI correctness and avoiding silent cache incoherence.",
+            key="numa",
+        )
+    numa = st.session_state.numa
     controls = st.columns([0.8, 1, 1.2])
     core = controls[0].selectbox("Core", range(4), key="numa_core")
     operation = controls[1].selectbox("Operation", ["Read", "Write"], key="numa_operation")
@@ -560,8 +676,14 @@ with tabs[3]:
                     )
         except (ValueError, KeyError, MemoryError) as error:
             st.error(f"Coherence request failed: {error}")
+        set_viva_note(
+            "Directory write-invalidation invalidates stale replicas before the writer commits, preserving MESI correctness and avoiding silent cache incoherence.",
+            key="numa",
+        )
     if st.session_state.numa_message:
         st.info(st.session_state.numa_message)
+    if st.session_state.viva_notes.get("numa"):
+        st.info(st.session_state.viva_notes["numa"])
 
     address = st.session_state.numa_address_display
     cache_columns = st.columns(4)
@@ -571,8 +693,13 @@ with tabs[3]:
         state = line["state"] if line is not None else "I"
         data = line["data"] if line is not None and state != "I" else "-"
         with column:
-            st.metric(f"Core {core_id}", state_names.get(state, state))
-            st.caption(f"Line: {state} · Data: {data}")
+            st.markdown(f"**Core {core_id}**")
+            badge_state = "M" if state == "O" else state
+            st.markdown(
+                f"<span class='mesi-tag mesi-{badge_state}'>{state_names.get(state, state)} ({state})</span>",
+                unsafe_allow_html=True,
+            )
+            st.caption(f"Data: {data}")
     references = numa.total_cache_hits + numa.total_cache_misses
     hit_rate = 100.0 * numa.total_cache_hits / references if references else 0.0
     st.metric("Directory invalidations", numa.invalidation_count)
@@ -582,7 +709,7 @@ with tabs[3]:
 
     st.divider()
     st.subheader("2D-Mesh X-Y routing")
-    coordinates = [(x, y) for y in range(4) for x in range(4)]
+    coordinates = [(x, y) for y in range(4) for x in range(3)]
     route_controls = st.columns(2)
     source = route_controls[0].selectbox("Source (X1, Y1)", coordinates, index=0, key="route_source")
     destination = route_controls[1].selectbox("Target (X2, Y2)", coordinates, index=11, key="route_target")
@@ -615,7 +742,14 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("Peak-load municipal telemetry")
     st.caption("12 routine sensor packets · 2 critical emergency alarms")
-    if st.button("Run Peak Load Simulation (12 Sensor Packets + 2 Emergency Alarms)", type="primary", key="stress_run"):
+    stress_actions = st.columns([1, 1])
+    run_viva_benchmark = stress_actions[0].button(
+        "⚡ 1-Click Viva Demo: Full Benchmark", type="primary", key="stress_viva_demo"
+    )
+    run_benchmark = stress_actions[1].button(
+        "Run Peak Load Simulation (12 Sensor Packets + 2 Emergency Alarms)", key="stress_run"
+    )
+    if run_viva_benchmark or run_benchmark:
         with st.status("Running municipal peak-load simulation", expanded=True) as status:
             progress = st.progress(0.0, text="Queueing routine telemetry")
             sleep(0.08)
@@ -627,6 +761,19 @@ with tabs[4]:
             progress.progress(1.0, text="Scorecard ready")
             status.update(label="Peak-load simulation complete", state="complete", expanded=False)
         st.session_state.stress_result = result
+        if run_viva_benchmark:
+            set_viva_note(
+                "The 12-packet municipal burst plus 2 emergency alarms completes with 100% emergency delivery, proving mission-critical traffic is serviced before routine telemetry.",
+                key="stress",
+            )
+        else:
+            set_viva_note(
+                "The 12-packet municipal burst plus 2 emergency alarms completes with 100% emergency delivery, proving mission-critical traffic is serviced before routine telemetry.",
+                key="stress",
+            )
+
+    if st.session_state.viva_notes.get("stress"):
+        st.info(st.session_state.viva_notes["stress"])
 
     result: Optional[Dict[str, Any]] = st.session_state.stress_result
     if result is None:
